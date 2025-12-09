@@ -1,4 +1,11 @@
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:http/http.dart' as http;
 
 class LiveCameraPage extends StatefulWidget {
   const LiveCameraPage({super.key});
@@ -7,232 +14,271 @@ class LiveCameraPage extends StatefulWidget {
   State<LiveCameraPage> createState() => _LiveCameraPageState();
 }
 
-class _LiveCameraPageState extends State<LiveCameraPage> {
-  bool connectionFailed = true;
+class _LiveCameraPageState extends State<LiveCameraPage>
+    with WidgetsBindingObserver {
+  static const streamUrl =
+      'https://incubator-dashboard-571778410429.us-central1.run.app/api/pi/8080/?action=stream';
+
+  late final WebViewController _controller;
+  final List<Map<String, String>> _cameraSources = [
+    {
+      'label': 'Baby View',
+      'url':
+          'https://incubator-dashboard-571778410429.us-central1.run.app/api/pi/8080/?action=stream',
+    },
+    {
+      'label': 'LCD View',
+      'url':
+          'https://incubator-dashboard-571778410429.us-central1.run.app/api/pi/8081/?action=stream',
+    },
+  ];
+
+  int _currentTab = 0;
+
+  String get _activeStreamUrl => _cameraSources[_currentTab]['url']!;
+
+  bool _isLoading = true;
+  bool _hasError = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(Colors.black)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageStarted: (_) {
+            setState(() {
+              _isLoading = true;
+              _hasError = false;
+            });
+
+            // ✅ Safety timeout
+            Future.delayed(const Duration(seconds: 3), () {
+              if (mounted && _isLoading) {
+                setState(() => _isLoading = false);
+              }
+            });
+          },
+          onProgress: (progress) {
+            if (progress > 20 && _isLoading) {
+              setState(() => _isLoading = false);
+            }
+          },
+          onWebResourceError: (_) {
+            setState(() {
+              _hasError = true;
+              _isLoading = false;
+            });
+          },
+        ),
+      )
+      ..loadRequest(Uri.parse(_activeStreamUrl));
+  }
+
+  // ✅ Pause stream when app goes to background (battery saver)
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) {
+      _controller.loadHtmlString('<html></html>');
+    } else if (state == AppLifecycleState.resumed) {
+      _controller.loadRequest(Uri.parse(_activeStreamUrl));
+    }
+  }
+
+  // ✅ Retry / Reload
+  void _reloadStream() {
+    setState(() {
+      _isLoading = true;
+      _hasError = false;
+    });
+    _controller.loadRequest(Uri.parse(
+      '$_activeStreamUrl&t=${DateTime.now().millisecondsSinceEpoch}',
+    ));
+  }
+
+  void _switchTab(int index) {
+    if (index == _currentTab) return;
+
+    setState(() {
+      _currentTab = index;
+      _isLoading = true;
+      _hasError = false;
+    });
+
+    // Clear current stream before loading another
+    _controller.loadHtmlString('<html></html>');
+
+    // Small delay ensures socket is released
+    Future.delayed(const Duration(milliseconds: 150), () {
+      _controller.loadRequest(Uri.parse(_activeStreamUrl));
+    });
+  }
+
+  // ✅ Snapshot support
+ Future<void> _takeSnapshot() async {
+  final permission = await Permission.storage.request();
+  if (!permission.isGranted) return;
+
+  try {
+    final response = await http.get(Uri.parse(_activeStreamUrl));
+    if (response.statusCode != 200) throw 'Failed to fetch frame';
+
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/camera_snapshot_${DateTime.now().millisecondsSinceEpoch}.jpg');
+    await file.writeAsBytes(response.bodyBytes);
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Snapshot saved: ${file.path}')),
+    );
+  } catch (e) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Snapshot failed: $e')),
+    );
+  }
+}
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    const primaryGreen = Color(0xFF00B686);
-    const darkBg = Color(0xFF0B1B18);
-    const panelBg = Color(0xFF112C27);
-
     return Scaffold(
-      backgroundColor: darkBg,
+      backgroundColor: const Color(0xFF0B1B18),
       appBar: AppBar(
-        backgroundColor: darkBg,
-        elevation: 0,
+        backgroundColor: const Color(0xFF0B1B18),
+        title: const Text(
+          "Live Camera",
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 22,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back_ios, color: Colors.white),
           onPressed: () => Navigator.pop(context),
         ),
-        title: const Text(
-          'Live Camera · Full View',
-          style: TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.w600,
-            fontSize: 22,
-          ),
-        ),
-        iconTheme: const IconThemeData(color: Colors.white),
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(18),
-        child: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Monitor the incubator feed with snapshot exports, resolution controls, and connection diagnostics.',
-                style: TextStyle(
-                  color: Colors.white70,
-                  fontSize: 13,
-                  height: 1.4,
-                ),
-              ),
-              const SizedBox(height: 24),
-
-              // Outer container (border frame)
-              Container(
-                decoration: BoxDecoration(
-                  color: panelBg,
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(
-                    color: Colors.redAccent.withOpacity(0.4),
-                    width: 1.4,
-                  ),
-                ),
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Header bar
-                    Container(
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF0B1B18),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                            color: Colors.redAccent.withOpacity(0.3),
-                            width: 1.0,
-                          ),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(48),
+          child: Row(
+            children: List.generate(_cameraSources.length, (index) {
+              final isSelected = _currentTab == index;
+              return Expanded(
+                child: GestureDetector(
+                  onTap: () => _switchTab(index),
+                  child: Container(
+                    height: 48,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      border: Border(
+                        bottom: BorderSide(
+                          color: isSelected
+                              ? Colors.greenAccent
+                              : Colors.transparent,
+                          width: 2,
                         ),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 12,
-                        ),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Row(
-                                    children: [
-                                      Icon(Icons.circle,
-                                          color: Colors.redAccent, size: 10),
-                                      SizedBox(width: 8),
-                                      Text(
-                                        'INC-001',
-                                        style: TextStyle(
-                                          color: Colors.white60,
-                                          fontSize: 12,
-                                          letterSpacing: 1,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  SizedBox(height: 4),
-                                  Text(
-                                    'Live Camera',
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.w600,
-                                      fontSize: 16,
-                                    ),
-                                    overflow: TextOverflow
-                                        .ellipsis, // Prevents long text overflow
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(width: 30),
-                            Flexible(
-                              fit: FlexFit.loose,
-                              child: ElevatedButton.icon(
-                                onPressed: () {
-                                  setState(() {
-                                    connectionFailed = !connectionFailed;
-                                  });
-                                },
-                                icon: const Icon(Icons.refresh,
-                                    size: 18, color: Colors.white),
-                                label: const Text('Retry',
-                                    overflow: TextOverflow.ellipsis),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor:
-                                      primaryGreen.withOpacity(0.15),
-                                  foregroundColor: Colors.white,
-                                  elevation: 0,
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 12, vertical: 10),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                    side: BorderSide(
-                                        color: primaryGreen.withOpacity(0.4)),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ],
-                        )),
-                    const SizedBox(height: 20),
-
-                    // Video / Status Box
-                    AnimatedContainer(
-                      duration: const Duration(milliseconds: 300),
-                      height: 300,
-                      decoration: BoxDecoration(
-                        color: panelBg,
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(
-                          color: Colors.redAccent.withOpacity(0.3),
-                          width: 1.0,
-                        ),
-                        gradient: LinearGradient(
-                          colors: [
-                            Colors.black.withOpacity(0.5),
-                            const Color(0xFF0B1B18),
-                          ],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
-                      ),
-                      child: Center(
-                        child: connectionFailed
-                            ? Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  const Icon(Icons.error_outline,
-                                      color: Colors.white38, size: 48),
-                                  const SizedBox(height: 12),
-                                  const Text(
-                                    'Connection Failed',
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.w600,
-                                      fontSize: 18,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 6),
-                                  const Text(
-                                    'Unable to connect to camera feed',
-                                    style: TextStyle(
-                                      color: Colors.white54,
-                                      fontSize: 13,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 20),
-                                  ElevatedButton(
-                                    onPressed: () {
-                                      setState(() {
-                                        connectionFailed = false;
-                                      });
-                                    },
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: Colors.redAccent,
-                                      shape: RoundedRectangleBorder(
-                                        borderRadius: BorderRadius.circular(20),
-                                      ),
-                                      padding: const EdgeInsets.symmetric(
-                                          horizontal: 32, vertical: 14),
-                                    ),
-                                    child: const Text(
-                                      'Try Again',
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.bold,
-                                        letterSpacing: 0.5,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              )
-                            : const Center(
-                                child: Text(
-                                  'Live feed streaming...',
-                                  style: TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: 16,
-                                  ),
-                                ),
-                              ),
                       ),
                     ),
-                  ],
+                    child: Text(
+                      _cameraSources[index]['label']!,
+                      style: TextStyle(
+                        color: isSelected ? Colors.greenAccent : Colors.white60,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-            ],
+              );
+            }),
           ),
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.camera_alt, color: Colors.white),
+            onPressed: _isLoading || _hasError ? null : _takeSnapshot,
+          ),
+          IconButton(
+            icon: const Icon(Icons.refresh, color: Colors.white),
+            onPressed: _reloadStream,
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          /// ✅ WebView Feed
+          Positioned.fill(
+            child: !_hasError
+                ? WebViewWidget(controller: _controller)
+                : _ErrorOverlay(onRetry: _reloadStream),
+          ),
+
+          /// ✅ Connecting overlay
+          if (_isLoading) const _ConnectingOverlay(),
+        ],
+      ),
+    );
+  }
+}
+
+
+
+class _ConnectingOverlay extends StatelessWidget {
+  const _ConnectingOverlay();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: Colors.black54,
+      child: const Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(color: Colors.white),
+            SizedBox(height: 16),
+            Text(
+              'Connecting to camera…',
+              style: TextStyle(color: Colors.white70),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ErrorOverlay extends StatelessWidget {
+  final VoidCallback onRetry;
+
+  const _ErrorOverlay({required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: Colors.black,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.error_outline, size: 60, color: Colors.redAccent),
+            const SizedBox(height: 12),
+            const Text(
+              'Camera connection failed',
+              style: TextStyle(color: Colors.white70),
+            ),
+            const SizedBox(height: 20),
+            ElevatedButton.icon(
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry'),
+            ),
+          ],
         ),
       ),
     );

@@ -1,12 +1,18 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
+import 'package:nicu_app/camera_access_manager_sheet.dart';
+import 'package:nicu_app/chat_page.dart';
 import 'package:nicu_app/live_camera_page.dart';
 import 'package:nicu_app/login_page.dart';
-import 'package:nicu_app/notifications_page.dart';
+import 'package:nicu_app/models/camera_access_request.dart';
+import 'package:nicu_app/notifications_page.dart'; // Import NotificationsPage
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:timeago/timeago.dart' as timeago;
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key});
@@ -18,32 +24,365 @@ class DashboardPage extends StatefulWidget {
 class _DashboardPageState extends State<DashboardPage> {
   final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
       FlutterLocalNotificationsPlugin();
-  List<String> notifications = [];
+  List<Map<String, dynamic>> notifications = [];
   Map<String, dynamic> vitalSigns = {};
-  bool isJaundiceDetected = false;
-  bool isCryDetected = true;
+  String isJaundiceDetected = '--';
+  String jaundiceProbability = '--';
+  String isCryDetected = '--';
+  String cryProbability = '--';
+  String username = '--';
+  Timer? _notificationTimer;
+  Set<int> seenNotificationIds = {};
+  DateTime? _lastTelemetryTime;
+  Timer? _timeUpdateTimer;
+
+  WebSocketChannel? channel;
+
+  final String thingsBoardWebSocketUrl =
+      'wss://34-49-101-188.nip.io/api/ws'; // Correct WebSocket URL
+  final String deviceId =
+      '0e066cf0-c31f-11f0-8a67-c384f4f53a9d'; // Your device ID
 
   @override
   void initState() {
     super.initState();
-    initializeNotifications();
-    fetchData();
-    startDataPolling();
-  }
-
-  Future<void> initializeNotifications() async {
-    const AndroidInitializationSettings initializationSettingsAndroid =
-        AndroidInitializationSettings('@mipmap/ic_launcher');
-    const InitializationSettings initializationSettings =
-        InitializationSettings(android: initializationSettingsAndroid);
-    await flutterLocalNotificationsPlugin.initialize(initializationSettings);
-  }
-
-  void startDataPolling() {
-    Future.delayed(const Duration(seconds: 10), () {
-      fetchData();
-      startDataPolling();
+    timeago.setLocaleMessages('en_custom', CustomTimeAgoMessages());
+    _checkToken();
+    _getUserInforemation();
+    fetchInitialTelemetry();
+    startWebSocketConnection();
+    _timeUpdateTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
     });
+  }
+
+  String _mapSeverityToRisk(String severity) {
+    switch (severity) {
+      case 'critical':
+        return 'High';
+      case 'warning':
+        return 'Medium';
+      default:
+        return 'Low';
+    }
+  }
+
+  Future<void> _checkToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('token');
+
+    if (token == null || token.isEmpty) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => const LoginPage()),
+      );
+    } else {
+      // fetchData();
+    }
+  }
+
+  Future<void> _getUserInforemation() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('token');
+
+    if (token != null && token.isNotEmpty) {
+      final response = await http.get(
+        Uri.parse('https://34-49-101-188.nip.io/api/auth/user'),
+        headers: {'Authorization': 'Bearer $token'},
+      );
+
+      if (response.statusCode == 200) {
+        final userData = json.decode(response.body);
+        print('User Information: ${userData["firstName"]}');
+        setState(() {
+          username = userData['firstName'] ?? 'User';
+        });
+      } else {
+        print(
+            'Failed to fetch user information. Status code: ${response.statusCode}');
+      }
+    }
+  }
+
+  Future<void> fetchInitialTelemetry() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString('token');
+
+      final deviceResponse = await http.get(
+        Uri.parse(
+            'https://34-49-101-188.nip.io/api/tenant/devices?deviceName=INC-001'),
+        headers: {'Authorization': 'Bearer $token'},
+      );
+      print('device response: ${deviceResponse.body}');
+      if (deviceResponse.statusCode == 200) {
+        final deviceData = json.decode(deviceResponse.body);
+
+        // Fetch telemetry data using deviceId
+        final telemetryResponse = await http.get(
+          Uri.parse(
+              'https://34-49-101-188.nip.io/api/plugins/telemetry/DEVICE/$deviceId/values/timeseries?keys=spo2,heart_rate,skin_temp,humidity,air_temp,jaundice_detected,jaundice_probability,cry_detected,nte_critical_count'),
+          headers: {'Authorization': 'Bearer $token'},
+        );
+
+        if (telemetryResponse.statusCode == 200) {
+          final telemetryData = json.decode(telemetryResponse.body);
+          print('telemetry data: $telemetryData');
+
+          String jaundiceProbabilityy = '';
+          String isJaundiceDetectedt = '';
+          String isCryDetectedt = '';
+
+          // Ensure we extract values correctly by checking the first element of the list
+          bool jaundiceDetected =
+              (telemetryData['jaundice_detected']?.first['value'] == 'true');
+
+          // Convert jaundice_probability to double if it's a string
+          double jaundiceProbabilityValue = double.tryParse(
+                  telemetryData['jaundice_probability']
+                          ?.first['value']
+                          .toString() ??
+                      '0') ??
+              0.0;
+          bool cryDetected =
+              (telemetryData['cry_detected']?.first['value'] == 'true');
+
+          // Set status based on the values
+          if (jaundiceDetected) {
+            if (jaundiceProbabilityValue > 70) {
+              jaundiceProbabilityy =
+                  'Probability at $jaundiceProbabilityValue% indicates high risk.';
+              isJaundiceDetectedt = 'Jaundice detected';
+            } else {
+              jaundiceProbabilityy =
+                  'Signal detected but below the high-risk threshold.';
+              isJaundiceDetectedt = 'Possible jaundice';
+            }
+          } else {
+            jaundiceProbabilityy =
+                'Skin tone appears within the expected range.';
+            isJaundiceDetectedt = 'No jaundice detected';
+          }
+
+          if (cryDetected) {
+            isCryDetectedt = 'Cry detected';
+          } else {
+            isCryDetectedt = 'Baby is Calm';
+          }
+
+          setState(() {
+            // vitalSigns = telemetryData;
+            jaundiceProbability = jaundiceProbabilityy; // Store the result
+            isJaundiceDetected = isJaundiceDetectedt; // Store the result
+            isCryDetected = isCryDetectedt;
+          });
+        }
+      }
+    } catch (e) {
+      print('Error fetching data: $e');
+    }
+  }
+
+  Future<void> _logout() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('token');
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(builder: (_) => const LoginPage()),
+    );
+  }
+
+  Future<void> startWebSocketConnection() async {
+    // Ensure the WebSocket URL is correct
+    String wsUrl = 'wss://34-49-101-188.nip.io/api/ws';
+    channel = WebSocketChannel.connect(Uri.parse(wsUrl));
+
+    if (channel == null) {
+      print('WebSocket connection failed');
+      return;
+    } else {
+      print('WebSocket connected to $wsUrl');
+    }
+
+    // Define your JWT token
+    final prefs = await SharedPreferences.getInstance();
+    String? token = prefs.getString(
+        'token'); // You should retrieve this token from SharedPreferences or your login mechanism
+    // Replace with your actual device ID
+
+    void reconnectWebSocket() async {
+      await Future.delayed(const Duration(seconds: 2));
+      await startWebSocketConnection();
+    }
+
+    channel!.stream.listen(
+      (data) {
+        try {
+          final decodedData = json.decode(data);
+
+          if (!decodedData.containsKey('data')) return;
+
+          final tsData = decodedData['data'];
+          _lastTelemetryTime = DateTime.now();
+          print('🔄 Telemetry update received at $_lastTelemetryTime: $tsData');
+
+          setState(() {
+            if (tsData['spo2'] != null) {
+              var val = tsData['spo2'][0][1];
+              vitalSigns['spo2'] = [
+                {'value': _parseNumeric(val)}
+              ];
+            }
+            if (tsData['heart_rate'] != null) {
+              var val = tsData['heart_rate'][0][1];
+              vitalSigns['heart_rate'] = [
+                {'value': _parseNumeric(val)}
+              ];
+            }
+            if (tsData['skin_temp'] != null) {
+              var val = tsData['skin_temp'][0][1];
+              vitalSigns['skin_temp'] = [
+                {'value': _parseNumeric(val)}
+              ];
+            }
+            if (tsData['humidity'] != null) {
+              var val = tsData['humidity'][0][1];
+              vitalSigns['humidity'] = [
+                {'value': _parseNumeric(val)}
+              ];
+            }
+            if (tsData['air_temp'] != null) {
+              var val = tsData['air_temp'][0][1];
+              vitalSigns['air_temp'] = [
+                {'value': _parseNumeric(val)}
+              ];
+            }
+          });
+
+          _checkForCryNotification(tsData);
+          _checkForJaundiceNotification(tsData);
+          _checkForNteNotification(tsData);
+        } catch (e, s) {
+          debugPrint('⚠️ Telemetry parse error: $e');
+          debugPrintStack(stackTrace: s);
+        }
+      },
+      onError: (e) {
+        debugPrint('❌ WebSocket error: $e');
+        reconnectWebSocket();
+      },
+      onDone: () {
+        debugPrint('🔌 WebSocket closed — reconnecting');
+        reconnectWebSocket();
+      },
+    );
+
+    // Send authentication command to ThingsBoard WebSocket
+    final authCommand = {
+      "authCmd": {
+        "cmdId": 0,
+        "token": token,
+      },
+      "cmds": [
+        {
+          "entityType": "DEVICE",
+          "entityId": deviceId, // Your device ID
+          "scope": "LATEST_TELEMETRY", // Telemetry scope
+          "cmdId": 10, // Command ID (arbitrary)
+          "type": "TIMESERIES",
+        }
+      ],
+    };
+
+    // Send the authentication command to initiate the WebSocket connection
+    channel!.sink.add(json.encode(authCommand));
+    print('Authentication command sent');
+  }
+
+  dynamic _parseNumeric(dynamic val) {
+    if (val is num) return val;
+    if (val is String) {
+      final parsed = double.tryParse(val);
+      if (parsed != null) return parsed;
+    }
+    return '--'; // fallback display string
+  }
+
+  void _checkForCryNotification(Map<String, dynamic> tsData) {
+    final cryList = tsData['cry_detected'];
+
+    if (cryList == null || cryList.isEmpty) return;
+
+    final cryValue = cryList[0][1];
+
+    if (cryValue == true || cryValue == 'true') {
+      showNotification('Cry Detected', 'The baby is crying');
+
+      _saveNotification({
+        'type': 'cry',
+        'risk': 'Medium',
+        'severity': 'warning',
+        'title': 'Cry Detected',
+        'message': 'The baby is crying',
+        'time': DateTime.now().toString(),
+      });
+    }
+  }
+
+  void _checkForJaundiceNotification(Map<String, dynamic> tsData) {
+    final list = tsData['jaundice_detected'];
+    if (list == null || list.isEmpty) return;
+
+    final val = list[0][1];
+    if (val == true || val == 'true') {
+      String message = 'Jaundice detected, please monitor the baby closely';
+      showNotification(
+        'Jaundice Detected',
+        message,
+      );
+      // Save notification in SharedPreferences
+      _saveNotification({
+        'type': 'jaundice',
+        'risk': 'High',
+        'severity': 'critical',
+        'title': 'Jaundice Detected',
+        'message': message,
+        'time': DateTime.now().toString(),
+      });
+    }
+  }
+
+  void _checkForNteNotification(Map<String, dynamic> tsData) {
+    print('nte data: ${tsData['nte_critical_count']}');
+    final list = tsData['nte_critical_count'];
+    if (list == null || list.isEmpty) return;
+
+    final count = int.tryParse(list[0][1].toString()) ?? 0;
+
+    if (count > 0) {
+      String message =
+          'Critical temperature readings detected. Immediate action required.';
+      showNotification(
+        'NTE Alert',
+        message,
+      );
+      _saveNotification({
+        'type': 'nte',
+        'risk': 'High',
+        'severity': 'critical',
+        'title': 'NTE Alert',
+        'message': message,
+        'time': DateTime.now().toString(),
+      });
+    }
+  }
+
+  Future<void> _saveNotification(Map<String, dynamic> notification) async {
+    final prefs = await SharedPreferences.getInstance();
+    List<String> notifications = prefs.getStringList('notifications') ?? [];
+    notifications.insert(
+        0, json.encode(notification)); // Insert at the start of the list
+    await prefs.setStringList('notifications', notifications);
   }
 
   Future<void> showNotification(String title, String body) async {
@@ -64,144 +403,120 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  Future<void> fetchData() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final token = prefs.getString('token');
-
-      final response = await http.get(
-        Uri.parse('YOUR_API_BASE_URL/dashboard-data'),
-        headers: {
-          'Authorization': 'Bearer $token',
-        },
-      );
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        setState(() {
-          vitalSigns = data['vitalSigns'];
-          isJaundiceDetected = data['jaundiceStatus'];
-          isCryDetected = data['cryStatus'];
-        });
-
-        if (data['notifications'] != null) {
-          for (var notification in data['notifications']) {
-            if (!notifications.contains(notification)) {
-              notifications.add(notification);
-              showNotification('Baby Monitor Alert', notification);
-            }
-          }
+// Function to send the subscription command after successful authentication
+  void sendSubscriptionCommand() {
+    final subscriptionCommand = {
+      "tsSubCmds": [
+        {
+          "entityType": "DEVICE",
+          "entityId": deviceId, // Your device ID
+          "scope": "LATEST_TELEMETRY", // Telemetry scope
+          "cmdId": 1, // Command ID (arbitrary)
+          "type": "TIMESERIES"
         }
-      }
-    } catch (e) {
-      print('Error fetching data: $e');
-    }
+      ],
+      "historyCmds": [], // No historical data
+      "attrSubCmds": [] // No attributes
+    };
+
+    // Send the subscription command to start receiving telemetry data
+    channel!.sink.add(json.encode(subscriptionCommand));
+    print('Subscription command sent');
   }
 
-  List<Map<String, dynamic>> formattedNotifications = [
-    {
-      "type": "jaundice",
-      "category": "Jaundice",
-      "title": "Jaundice Detection Alert",
-      "message": "Jaundice detected with 82% confidence",
-      "risk": "Medium",
-      "time": "9m ago",
+  Future<CameraAccessRequest> _toggleCameraAccess(
+    CameraAccessRequest req, String newStatus) async {
+  final prefs = await SharedPreferences.getInstance();
+  final token = prefs.getString('token');
+
+  if (token == null || token.isEmpty) {
+    throw Exception('User not authenticated');
+  }
+
+  final url = Uri.parse(
+      'https://incubator-dashboard-571778410429.us-central1.run.app/api/parent/clinician/camera-access/${req.parentId}');
+
+  final response = await http.patch(
+    url,
+    headers: {
+      'X-API-Key': 'clinician-api-key-12345',
+      'Content-Type': 'application/json',
     },
-    {
-      "type": "jaundice",
-      "category": "Jaundice",
-      "title": "Jaundice Detection Alert",
-      "message": "Jaundice detected with 69% confidence",
-      "risk": "Low",
-      "time": "19m ago",
-    },
-    {
-      "type": "cry",
-      "category": "Cry",
-      "title": "Cry Detected",
-      "message": "High-intensity cry detected for more than 10 seconds",
-      "risk": "Medium",
-      "time": "32m ago",
-    },
-    {
-      "type": "cry",
-      "category": "Cry",
-      "title": "Cry Detected",
-      "message": "Normal cry detected. Baby might need attention.",
-      "risk": "Low",
-      "time": "1h ago",
-    },
-    {
-      "type": "nte",
-      "category": "NTE",
-      "title": "Temperature Alert",
-      "message": "Body temperature dropped to 36.1°C",
-      "risk": "High",
-      "time": "1h 12m ago",
-    },
-    {
-      "type": "nte",
-      "category": "NTE",
-      "title": "Heart Rate Warning",
-      "message": "Heart rate reached 162 bpm",
-      "risk": "Medium",
-      "time": "2h ago",
-    },
-    {
-      "type": "nte",
-      "category": "NTE",
-      "title": "SpO₂ Alert",
-      "message": "Oxygen saturation fell to 88%",
-      "risk": "High",
-      "time": "2h 33m ago",
-    },
-    {
-      "type": "other",
-      "category": "General",
-      "title": "New Baby Registered",
-      "message": "Baby INC003 added to the monitoring system",
-      "risk": "Low",
-      "time": "3h ago",
-    },
-    {
-      "type": "other",
-      "category": "General",
-      "title": "System Check Completed",
-      "message": "All sensors calibrated and active",
-      "risk": "Low",
-      "time": "5h ago",
-    },
-    {
-      "type": "cry",
-      "category": "Cry",
-      "title": "Cry Spike",
-      "message": "Sudden cry spike detected at 11:29 AM",
-      "risk": "Medium",
-      "time": "6h ago",
-    },
-    {
-      "type": "jaundice",
-      "category": "Jaundice",
-      "title": "Jaundice Detection Alert",
-      "message": "Jaundice detected with 91% confidence",
-      "risk": "High",
-      "time": "6h 45m ago",
-    },
-    {
-      "type": "nte",
-      "category": "NTE",
-      "title": "Humidity Alert",
-      "message": "Humidity dropped to 49%",
-      "risk": "Low",
-      "time": "8h ago",
-    },
-  ];
+    body: json.encode({
+      'babyId': req.babyId,
+      'status': newStatus,
+      'parentName': req.parentName,
+    }),
+  );
+
+  if (response.statusCode != 200) {
+    // Try to parse the error message
+    final payload = json.decode(response.body);
+    throw Exception(payload['error'] ?? 'Failed to update camera access');
+  }
+
+  final payload = json.decode(response.body);
+  final entry = payload['entry'] ?? {};
+
+  return CameraAccessRequest(
+    parentId: entry['parentId'] ?? req.parentId,
+    babyId: entry['babyId']?.toString() ?? req.babyId,
+    parentName: entry['parentName'] ?? req.parentName,
+    phone: req.phone, // Phone is not updated by backend
+    status: entry['status'] ?? newStatus,
+    pendingRequest: entry['pendingRequest'] ?? false,
+    requestedAt: entry['requestedAt'] != null
+        ? DateTime.parse(entry['requestedAt'])
+        : null,
+    updatedAt: entry['updatedAt'] != null
+        ? DateTime.parse(entry['updatedAt'])
+        : DateTime.now(),
+    parentCreatedAt: req.parentCreatedAt,
+  );
+}
+
+
+  Future<List<CameraAccessRequest>> _fetchCameraRequests() async {
+    final res = await http.get(
+      Uri.parse(
+        'https://incubator-dashboard-571778410429.us-central1.run.app/api/parent/clinician/camera-access/requests',
+      ),
+      headers: {
+        'X-API-Key': 'clinician-api-key-12345',
+        'Content-Type': 'application/json',
+      },
+    );
+
+    print('Camera Requests Response: ${res.body}');
+
+    if (res.statusCode != 200) {
+      throw Exception('Failed to fetch camera requests');
+    }
+
+    final decoded = json.decode(res.body);
+
+    if (decoded is Map && decoded['entries'] is List) {
+      return (decoded['entries'] as List)
+          .map((e) => CameraAccessRequest.fromJson(e))
+          .toList();
+    }
+
+    throw Exception('Unexpected camera request response format');
+  }
+
+  @override
+  void dispose() {
+    _notificationTimer?.cancel();
+    _timeUpdateTimer?.cancel(); // ✅ VERY important
+    channel?.sink.close();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return SafeArea(
       child: Scaffold(
-        backgroundColor: const Color(0xFF0B1B18), // dark teal/green background
+        backgroundColor: const Color(0xFF0B1B18),
         appBar: PreferredSize(
           preferredSize: const Size.fromHeight(80),
           child: Column(
@@ -214,8 +529,6 @@ class _DashboardPageState extends State<DashboardPage> {
                 centerTitle: false,
                 title: Row(
                   children: [
-                    // left logo box (use your asset or an Icon fallback)
-
                     Container(
                       width: 46,
                       height: 46,
@@ -236,21 +549,21 @@ class _DashboardPageState extends State<DashboardPage> {
                       ),
                     ),
                     const SizedBox(width: 15),
-                    const Expanded(
+                    Expanded(
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Hello, Hasini',
-                            style: TextStyle(
+                            'Hello, $username',
+                            style: const TextStyle(
                               color: Colors.white,
                               fontSize: 22,
                               fontWeight: FontWeight.w500,
                             ),
                           ),
-                          SizedBox(height: 2),
-                          Text(
+                          const SizedBox(height: 2),
+                          const Text(
                             'NICU MONITORING UNIT',
                             style: TextStyle(
                               color: Colors.white54,
@@ -272,14 +585,7 @@ class _DashboardPageState extends State<DashboardPage> {
                           ),
                           onSelected: (value) async {
                             if (value == 'logout') {
-                              final prefs =
-                                  await SharedPreferences.getInstance();
-                              await prefs.clear();
-                              Navigator.pushReplacement(
-                                context,
-                                MaterialPageRoute(
-                                    builder: (_) => const LoginPage()),
-                              );
+                              _logout();
                             }
                           },
                           itemBuilder: (context) => [
@@ -311,80 +617,115 @@ class _DashboardPageState extends State<DashboardPage> {
           ),
         ),
         body: RefreshIndicator(
-          onRefresh: fetchData,
+          onRefresh: () async {
+            await fetchInitialTelemetry();
+          },
           child: SingleChildScrollView(
             physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.all(16.0),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Top row with label + icons
+                /// Section Header
                 Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     const Text(
                       'Monitoring Overview',
                       style: TextStyle(
                         color: Colors.white,
-                        fontSize: 20,
-                        fontWeight: FontWeight.w600,
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
-                    Row(
-                      children: [
-                        // Camera icon button
-                        _buildIconButton(
-                          icon: Icons.camera_alt_outlined,
-                          onTap: () {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                  builder: (_) => const LiveCameraPage()),
-                            );
-                          },
-                        ),
+                    const Spacer(),
 
-                        const SizedBox(width: 12),
-                        // Notification icon button with badge
-                        Stack(
-                          clipBehavior: Clip.none,
-                          children: [
-                            _buildIconButton(
-                              icon: Icons.notifications_none_rounded,
-                              onTap: () {
-                                Navigator.push(
-                                  context,
-                                  MaterialPageRoute(
-                                    builder: (_) => NotificationsPage(
-                                      notifications: formattedNotifications,
-                                    ),
-                                  ),
-                                );
-                              },
-                            ),
-                            if (formattedNotifications.isNotEmpty)
-                              Positioned(
-                                right: -2,
-                                top: -2,
-                                child: Container(
-                                  padding: const EdgeInsets.all(4),
-                                  decoration: const BoxDecoration(
-                                    color: Colors.redAccent,
-                                    shape: BoxShape.circle,
-                                  ),
-                                  constraints: const BoxConstraints(
-                                      minWidth: 12, minHeight: 12),
-                                ),
+                    /// Notifications
+                    InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                              builder: (_) => const NotificationsPage()),
+                        );
+                      },
+                      child: Stack(
+                        clipBehavior: Clip.none,
+                        children: [
+                          _iconContainer(Icons.notifications),
+                          Positioned(
+                            right: -2,
+                            top: -2,
+                            child: Container(
+                              width: 10,
+                              height: 10,
+                              decoration: const BoxDecoration(
+                                color: Colors.red,
+                                shape: BoxShape.circle,
                               ),
-                          ],
-                        ),
-                      ],
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 20),
 
-// Title below icons
+                const SizedBox(height: 12),
+
+                /// Action buttons row
+                Row(
+                  children: [
+                    _actionButton(
+                      icon: Icons.camera_alt,
+                      label: 'Live Camera',
+                      onTap: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                              builder: (_) => const LiveCameraPage()),
+                        );
+                      },
+                    ),
+                    const SizedBox(width: 12),
+                    _actionButton(
+                      icon: Icons.lock_person_rounded,
+                      label: 'Camera Access',
+                      onTap: () async {
+                        final requests = await _fetchCameraRequests();
+                        showModalBottomSheet(
+                          context: context,
+                          isScrollControlled: true,
+                          backgroundColor: Colors.transparent,
+                          builder: (_) => CameraAccessManagerSheet(
+                            requests: requests,
+                            onToggle: _toggleCameraAccess,
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 20),
+                Row(
+                  children: [
+                    const Icon(Icons.access_time,
+                        color: Colors.white60, size: 16),
+                    const SizedBox(width: 6),
+                    Text(
+                      _lastTelemetryTime == null
+                          ? 'Waiting for live data…'
+                          : 'Last updated ${formatTimeAgo(_lastTelemetryTime!)}',
+                      style: const TextStyle(
+                        color: Colors.white60,
+                        fontSize: 12,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
 
                 const Text(
                   'Live Vital Signs',
@@ -405,24 +746,32 @@ class _DashboardPageState extends State<DashboardPage> {
                   children: [
                     _buildVitalCard(
                         'SpO₂',
-                        '${vitalSigns['oxygenLevel'] ?? '96'} %',
+                        '${vitalSigns['spo2']?.first['value'] ?? '--'} %',
                         const Color(0xFFB45309),
-                        Icons.favorite_rounded),
+                        Icons.favorite_rounded,
+                        false,
+                        '--'),
                     _buildVitalCard(
                         'Heart Rate',
-                        '${vitalSigns['heartRate'] ?? '63'} bpm',
+                        '${vitalSigns['heart_rate']?.first['value'] ?? '--'} bpm',
                         const Color(0xFFB30000),
-                        Icons.favorite_rounded),
+                        Icons.favorite_rounded,
+                        false,
+                        '--'),
                     _buildVitalCard(
                         'Skin Temperature',
-                        '${vitalSigns['temperature'] ?? '36.7'} °C',
+                        '${vitalSigns['skin_temp']?.first['value'] ?? '--'} °C',
                         const Color.fromARGB(255, 94, 3, 65),
-                        Icons.bar_chart_rounded),
+                        Icons.bar_chart_rounded,
+                        true,
+                        '${vitalSigns['air_temp']?.first['value'] ?? '--'} °C'),
                     _buildVitalCard(
                         'Humidity',
-                        '${vitalSigns['humidity'] ?? '61'} %',
+                        '${vitalSigns['humidity']?.first['value'] ?? '--'} %',
                         const Color(0xFF00997A),
-                        Icons.cloud),
+                        Icons.cloud,
+                        false,
+                        '--'),
                   ],
                 ),
                 const SizedBox(height: 28),
@@ -435,50 +784,77 @@ class _DashboardPageState extends State<DashboardPage> {
                   ),
                 ),
                 const SizedBox(height: 16),
-                _buildStatusCard('Jaundice Detection', isJaundiceDetected),
+                _buildJaundiceStatusCard('Jaundice Detection',
+                    isJaundiceDetected, jaundiceProbability),
                 const SizedBox(height: 8),
-                _buildStatusCard('Cry Detection', isCryDetected),
+                _buildCryStatusCard('Cry Detection', isCryDetected),
               ],
             ),
+          ),
+        ),
+        floatingActionButton: FloatingActionButton(
+          onPressed: () {
+            // Navigate to the chat page when FAB is pressed
+            Navigator.push(
+              context,
+              MaterialPageRoute(builder: (context) => const ChatPage()),
+            );
+          },
+          backgroundColor: const Color(0xFF00B686),
+          child: const Icon(Icons.chat),
+        ),
+      ),
+    );
+  }
+
+  Widget _iconContainer(IconData icon) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF112C27),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Icon(icon, color: Colors.white, size: 22),
+    );
+  }
+
+  Widget _actionButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          decoration: BoxDecoration(
+            color: const Color(0xFF112C27),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, color: const Color(0xFF00B686), size: 26),
+              const SizedBox(height: 6),
+              Text(
+                label,
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
           ),
         ),
       ),
     );
   }
 
-  Widget _buildIconButton({
-    required IconData icon,
-    required VoidCallback onTap,
-  }) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 50,
-        height: 50,
-        decoration: BoxDecoration(
-          color: const Color(0xFF112C27),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-              color: const Color(0xFF00B686).withOpacity(0.4), width: 1.2),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.2),
-              blurRadius: 6,
-              offset: const Offset(0, 3),
-            ),
-          ],
-        ),
-        child: Icon(
-          icon,
-          color: const Color(0xFF57B798),
-          size: 26,
-        ),
-      ),
-    );
-  }
-
-  Widget _buildVitalCard(
-      String title, String value, Color color, IconData icon) {
+  Widget _buildVitalCard(String title, String value, Color color, IconData icon,
+      bool istemp, String alt) {
     return Container(
       decoration: BoxDecoration(
         gradient: LinearGradient(
@@ -495,7 +871,6 @@ class _DashboardPageState extends State<DashboardPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // top row with icon + status
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -527,180 +902,350 @@ class _DashboardPageState extends State<DashboardPage> {
             ],
           ),
           const SizedBox(height: 15),
-
-          // Title
-          Text(
-            title,
-            style: const TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.w600,
-              fontSize: 16,
-            ),
-          ),
-
-          const SizedBox(height: 8),
-
-          // Value
-          Text(
-            value,
-            style: const TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.bold,
-              fontSize: 28,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildStatusCard(String type, bool status) {
-    bool isJaundice = type == 'Jaundice Detection';
-    String moduleType =
-        isJaundice ? 'IMAGING ANALYTICS MODULE' : 'VOICE ANALYTICS MODULE';
-    Color borderColor = status
-        ? (isJaundice ? Colors.redAccent : Colors.greenAccent)
-        : const Color(0xFF00B686);
-
-    String headline = isJaundice
-        ? (status ? 'Jaundice detected' : 'No jaundice detected')
-        : (status ? 'Baby crying' : 'Baby is calm');
-
-    String subtext = isJaundice
-        ? (status
-            ? 'Probability at 82.3% indicates high risk.'
-            : 'Monitoring shows no signs of jaundice.')
-        : (status
-            ? 'Crying detected above normal sound threshold.'
-            : 'Sound levels within the expected range.');
-
-    Color headlineColor = status
-        ? (isJaundice ? Colors.redAccent : Colors.yellowAccent)
-        : Colors.white;
-
-    Color backgroundColor = const Color(0xFF112C27);
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 14),
-      decoration: BoxDecoration(
-        color: backgroundColor,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: borderColor.withOpacity(0.7), width: 1.5),
-        boxShadow: [
-          BoxShadow(
-            color: borderColor.withOpacity(0.3),
-            blurRadius: 8,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      padding: const EdgeInsets.all(18),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Top row: title and monitoring status
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    type,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    moduleType,
-                    style: const TextStyle(
-                      color: Colors.white54,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w400,
-                    ),
-                  ),
-                ],
-              ),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: Colors.green.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: Colors.greenAccent, width: 1),
-                ),
-                child: const Row(
+          istemp
+              ? const Row(
                   children: [
-                    Icon(Icons.circle, size: 8, color: Colors.greenAccent),
-                    SizedBox(width: 6),
                     Text(
-                      'Monitoring active',
+                      'Skin Temp',
                       style: TextStyle(
-                        color: Colors.greenAccent,
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 12,
+                      ),
+                    ),
+                    SizedBox(width: 24),
+                    Text(
+                      'Air Temp',
+                      style: TextStyle(
+                        color: Colors.white70,
                         fontSize: 12,
                       ),
                     ),
                   ],
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          // Status Box
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-            decoration: BoxDecoration(
-              color: status
-                  ? (isJaundice
-                      ? Colors.red.shade900.withOpacity(0.8)
-                      : Colors.teal.shade800)
-                  : Colors.teal.shade900.withOpacity(0.7),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(
-                  status
-                      ? (isJaundice
-                          ? Icons.error_outline
-                          : Icons.mood_bad_outlined)
-                      : Icons.sentiment_satisfied_alt_outlined,
-                  color: headlineColor,
-                  size: 26,
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        headline,
-                        style: TextStyle(
-                          color: headlineColor,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 16,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        subtext,
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ],
+                )
+              : Text(
+                  title,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 16,
                   ),
                 ),
-              ],
-            ),
-          ),
+          const SizedBox(height: 8),
+          istemp
+              ? Row(
+                  children: [
+                    Text(
+                      value,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                      ),
+                    ),
+                    const SizedBox(width: 22),
+                    Text(
+                      alt,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 16,
+                      ),
+                    ),
+                  ],
+                )
+              : Text(
+                  value,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 28,
+                  ),
+                ),
         ],
       ),
     );
   }
+
+  Widget _buildJaundiceStatusCard(String type, String status, String detail) {
+    Color borderColor;
+    Color statusColor;
+
+    if (status.contains('Jaundice detected')) {
+      borderColor = Colors.redAccent;
+      statusColor = Colors.redAccent;
+    } else if (status.contains('Possible jaundice')) {
+      borderColor = Colors.amber;
+      statusColor = Colors.amber;
+    } else {
+      borderColor = Colors.greenAccent;
+      statusColor = Colors.greenAccent;
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            borderColor.withOpacity(0.2),
+            Colors.transparent,
+          ],
+        ),
+        color: const Color(0xFF112C27),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: borderColor, width: 2.0),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: statusColor,
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Icon(
+                  status.contains('Jaundice detected')
+                      ? Icons.warning_amber_outlined
+                      : Icons.circle,
+                  color: Colors.white,
+                  size: 16,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                type,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Spacer(),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            status,
+            style: TextStyle(
+              color: statusColor,
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            detail,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 14,
+              fontStyle: FontStyle.italic,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Divider(
+            color: statusColor,
+            thickness: 2.0,
+            height: 10,
+          ),
+          const SizedBox(height: 8),
+          // const Row(
+          //   children: [
+          //     Icon(
+          //       Icons.access_time,
+          //       color: Colors.white70,
+          //       size: 16,
+          //     ),
+          //     SizedBox(width: 6),
+          //     // Text(
+          //     //   'Last updated: ${DateTime.now().toString().substring(0, 19)}', // Example timestamp
+          //     //   style: const TextStyle(
+          //     //     color: Colors.white60,
+          //     //     fontSize: 12,
+          //     //   ),
+          //     // ),
+          //   ],
+          // ),
+        ],
+      ),
+    );
+  }
+
+  String formatTimeAgo(DateTime time) {
+    final diff = DateTime.now().difference(time);
+    final formatted = timeago.format(
+      time,
+      locale: 'en_custom',
+    );
+
+    // If it says "just now", don't append 'ago'
+    if (formatted == 'just now') return formatted;
+    return formatted; // otherwise it will include 'ago' automatically
+  }
+}
+
+class CustomTimeAgoMessages implements timeago.LookupMessages {
+  @override
+  String prefixAgo() => '';
+  @override
+  String prefixFromNow() => '';
+  @override
+  String suffixAgo() => '';
+  @override
+  String suffixFromNow() => 'from now';
+  @override
+  String wordSeparator() => ' ';
+
+  @override
+  String lessThanOneMinute(int seconds) {
+    if (seconds < 5) return 'just now'; // no 'ago'
+    return '$seconds seconds ago';
+  }
+
+  @override
+  String aboutAMinute(int minutes) => '1 minute';
+  @override
+  String oneMinute(int minutes) => '1 minute';
+  @override
+  String minutes(int minutes) => '$minutes minutes';
+  @override
+  String aboutAnHour(int minutes) => 'about 1 hour';
+  @override
+  String oneHour(int minutes) => '1 hour';
+  @override
+  String hours(int hours) => '$hours hours';
+  @override
+  String aDay(int hours) => '1 day';
+  @override
+  String aboutADay(int hours) => 'about 1 day';
+  @override
+  String oneDay(int hours) => '1 day';
+  @override
+  String days(int days) => '$days days';
+  @override
+  String aboutAMonth(int days) => 'about 1 month';
+  @override
+  String oneMonth(int days) => '1 month';
+  @override
+  String months(int months) => '$months months';
+  @override
+  String aboutAYear(int year) => 'about 1 year';
+  @override
+  String oneYear(int years) => '1 year';
+  @override
+  String years(int years) => '$years years';
+}
+
+Widget _buildCryStatusCard(String type, String status) {
+  Color borderColor;
+  Color statusColor;
+
+  // Set color based on the cry detection status
+  if (status == 'Cry detected') {
+    borderColor = Colors.redAccent;
+    statusColor = Colors.redAccent;
+  } else if (status == 'Baby is Calm') {
+    borderColor = Colors.greenAccent;
+    statusColor = Colors.greenAccent;
+  } else {
+    borderColor = Colors.blueAccent; // Default color if status is not set
+    statusColor = Colors.blueAccent;
+  }
+
+  return Container(
+    margin: const EdgeInsets.only(bottom: 14),
+    padding: const EdgeInsets.all(18),
+    decoration: BoxDecoration(
+      gradient: LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [
+          borderColor.withOpacity(0.2),
+          Colors.transparent,
+        ],
+      ),
+      color: const Color(0xFF112C27),
+      borderRadius: BorderRadius.circular(18),
+      border: Border.all(color: borderColor, width: 2.0),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: statusColor,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Icon(
+                status == 'Cry detected'
+                    ? Icons.warning_amber_outlined
+                    : Icons.circle,
+                color: Colors.white,
+                size: 16,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Text(
+              type,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const Spacer(),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Text(
+          status,
+          style: TextStyle(
+            color: statusColor,
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 10),
+        const Text(
+          'Please monitor the baby closely.',
+          style: TextStyle(
+            color: Colors.white70,
+            fontSize: 14,
+            fontStyle: FontStyle.italic,
+          ),
+        ),
+        const SizedBox(height: 10),
+        Divider(
+          color: statusColor,
+          thickness: 2.0,
+          height: 10,
+        ),
+        const SizedBox(height: 8),
+        // const Row(
+        //   children: [
+        //     Icon(
+        //       Icons.access_time,
+        //       color: Colors.white70,
+        //       size: 16,
+        //     ),
+        //     SizedBox(width: 6),
+        //     // Text(
+        //     //   'Last updated: ${DateTime.now().toString().substring(0, 19)}', // Example timestamp
+        //     //   style: const TextStyle(
+        //     //     color: Colors.white60,
+        //     //     fontSize: 12,
+        //     //   ),
+        //     // ),
+        //   ],
+        // ),
+      ],
+    ),
+  );
 }

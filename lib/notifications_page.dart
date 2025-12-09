@@ -1,9 +1,11 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class NotificationsPage extends StatefulWidget {
-  final List<Map<String, dynamic>> notifications;
 
-  const NotificationsPage({super.key, required this.notifications});
+  const NotificationsPage({super.key});
 
   @override
   State<NotificationsPage> createState() => _NotificationsPageState();
@@ -13,9 +15,25 @@ class _NotificationsPageState extends State<NotificationsPage>
     with SingleTickerProviderStateMixin {
   late TabController tabController;
 
+  // Add this to hold the notifications
+  List<Map<String, dynamic>> notifications = [];
+
+  // Load notifications
+  Future<void> _loadNotifications() async {
+    final prefs = await SharedPreferences.getInstance();
+    List<String> notificationList = prefs.getStringList('notifications') ?? [];
+    setState(() {
+      // Decode the JSON strings and cast them to List<Map<String, dynamic>>
+      notifications = notificationList
+          .map((item) => Map<String, dynamic>.from(json.decode(item)))
+          .toList();
+    });
+  }
+
   @override
   void initState() {
     super.initState();
+    _loadNotifications(); // Load notifications when the page is opened
     tabController = TabController(length: 4, vsync: this);
   }
 
@@ -54,7 +72,7 @@ class _NotificationsPageState extends State<NotificationsPage>
       body: TabBarView(
         controller: tabController,
         children: [
-          _list(widget.notifications),
+          _list(notifications),
           _list(_filter("nte")),
           _list(_filter("cry")),
           _list(_filter("jaundice")),
@@ -64,7 +82,7 @@ class _NotificationsPageState extends State<NotificationsPage>
   }
 
   List<Map<String, dynamic>> _filter(String type) {
-    return widget.notifications.where((n) => n["type"] == type).toList();
+    return notifications.where((n) => n["type"] == type).toList();
   }
 
   Widget _list(List<Map<String, dynamic>> data) {
@@ -88,10 +106,10 @@ class _NotificationsPageState extends State<NotificationsPage>
 
   Widget _buildNotificationCard(Map<String, dynamic> item) {
     final Color bgColor = item["risk"] == "High"
-        ? Colors.red.withOpacity(0.25)
+        ? Colors.red.withOpacity(0.8)
         : item["risk"] == "Medium"
-            ? Colors.orange.withOpacity(0.25)
-            : Colors.blue.withOpacity(0.25);
+            ? Colors.orange.withOpacity(0.8)
+            : Colors.blue.withOpacity(0.8);
 
     final IconData icon = item["risk"] == "High"
         ? Icons.warning_amber_outlined
@@ -161,3 +179,4 @@ class _NotificationsPageState extends State<NotificationsPage>
     );
   }
 }
+
