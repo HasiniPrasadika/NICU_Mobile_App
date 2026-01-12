@@ -23,6 +23,13 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
       
+      - name: Get pods
+        run: |
+          cd ios
+          pod repo update
+          pod install
+          cd ..
+      
       - name: Build iOS
         run: flutter build ios --release --no-codesign
       
