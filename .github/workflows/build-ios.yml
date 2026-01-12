@@ -1,0 +1,48 @@
+name: Build iOS App
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.x'
+          cache: true
+      
+      - name: Get dependencies
+        run: flutter pub get
+      
+      - name: Build iOS
+        run: flutter build ios --release --no-codesign
+      
+      - name: Create IPA
+        run: |
+          cd build/ios/Release-iphoneos
+          mkdir -p Payload
+          mv Runner.app Payload/
+          zip -r -q app.ipa Payload/
+          mv app.ipa ../../..
+      
+      - name: Upload IPA as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ios-app
+          path: app.ipa
+          retention-days: 30
+      
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: app.ipa
